@@ -16,4 +16,6 @@ app.post("/run", (req, res) => {
   });
 });
 
-app.listen(8080, () => console.log("Sandbox ready"));
+app.listen(process.env.PORT || 8080, "0.0.0.0", () => {
+  console.log("Sandbox ready");
+});
