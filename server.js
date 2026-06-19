@@ -13,10 +13,6 @@ const SANDBOX_ROOT = process.env.SANDBOX_ROOT || "/sandbox";
 
 fs.mkdirSync(SANDBOX_ROOT, { recursive: true });
 
-/* -----------------------------
-   Utilities
-------------------------------*/
-
 function uuid() {
     return crypto.randomUUID();
 }
@@ -29,67 +25,75 @@ function writeFiles(workspace, files = []) {
     }
 }
 
-/* -----------------------------
-   Safe command parser
-------------------------------*/
+/* -------------------------
+   Runtime isolation layer
+------------------------- */
 
-function parseCommand(cmd) {
-    const parts = cmd.trim().split(/\s+/);
-    return {
-        bin: parts[0],
-        args: parts.slice(1)
-    };
+function resolveEnv(runtime) {
+    switch (runtime) {
+        case "java17":
+            return {
+                ...process.env,
+                JAVA_HOME: process.env.JAVA17_HOME,
+                PATH: `${process.env.JAVA17_HOME}/bin:${process.env.PATH}`
+            };
+
+        case "java21":
+            return {
+                ...process.env,
+                JAVA_HOME: process.env.JAVA21_HOME,
+                PATH: `${process.env.JAVA21_HOME}/bin:${process.env.PATH}`
+            };
+
+        default:
+            return process.env;
+    }
 }
 
-/* -----------------------------
-   Forbidden commands
-------------------------------*/
+/* -------------------------
+   Command execution (hardened)
+------------------------- */
 
-const FORBIDDEN = new Set([
-    "sudo",
-    "shutdown",
-    "reboot",
-    "mkfs",
-    "mount",
-    "umount",
-    "iptables",
-    "docker"
-]);
-
-function isForbidden(bin) {
-    return FORBIDDEN.has(bin);
-}
-
-/* -----------------------------
-   Executor (spawn-based)
-------------------------------*/
-
-function run(bin, args, cwd) {
+function run(bin, args, cwd, env) {
     return new Promise((resolve) => {
-
-        const start = Date.now();
 
         const child = spawn(bin, args, {
             cwd,
-            shell: false
+            env,
+            shell: false,
+            detached: true
         });
 
         let stdout = "";
         let stderr = "";
 
+        const timeout = setTimeout(() => {
+            try {
+                process.kill(-child.pid); // kill process group
+            } catch {}
+            resolve({
+                stdout,
+                stderr,
+                exitCode: 124,
+                error: "Timeout"
+            });
+        }, 15000);
+
         child.stdout.on("data", d => stdout += d.toString());
         child.stderr.on("data", d => stderr += d.toString());
 
         child.on("close", code => {
+            clearTimeout(timeout);
             resolve({
                 stdout,
                 stderr,
                 exitCode: code,
-                durationMs: Date.now() - start
+                durationMs: Date.now()
             });
         });
 
         child.on("error", err => {
+            clearTimeout(timeout);
             resolve({
                 stdout,
                 stderr,
@@ -100,70 +104,33 @@ function run(bin, args, cwd) {
     });
 }
 
-/* -----------------------------
-   Auto-heal (basic v1)
-------------------------------*/
+/* -------------------------
+   Command parsing (minimal safety layer)
+------------------------- */
 
-async function autoHeal(workspace, bin, args, result) {
-
-    const stderr = result.stderr || "";
-
-    // Node missing module
-    if (stderr.includes("Cannot find module")) {
-        await run("npm", ["install"], workspace);
-        return true;
-    }
-
-    // Python missing deps
-    if (stderr.includes("ModuleNotFoundError")) {
-        if (fs.existsSync(path.join(workspace, "requirements.txt"))) {
-            await run("pip3", ["install", "-r", "requirements.txt"], workspace);
-            return true;
-        }
-    }
-
-    // Go module missing
-    if (stderr.includes("go.mod")) {
-        await run("go", ["mod", "init", "sandbox"], workspace);
-        return true;
-    }
-
-    // Rust rebuild
-    if (stderr.includes("cargo")) {
-        await run("cargo", ["build"], workspace);
-        return true;
-    }
-
-    return false;
+function parseCommand(cmd) {
+    const parts = cmd.trim().split(/\s+/);
+    return {
+        bin: parts[0],
+        args: parts.slice(1)
+    };
 }
 
-/* -----------------------------
-   Runtime router
-------------------------------*/
+/* -------------------------
+   Executor
+------------------------- */
 
 async function execute(runtime, command, workspace) {
-
     const { bin, args } = parseCommand(command);
 
-    if (isForbidden(bin)) {
-        return { error: "Forbidden command" };
-    }
+    const env = resolveEnv(runtime);
 
-    let result = await run(bin, args, workspace);
-
-    const healed = await autoHeal(workspace, bin, args, result);
-
-    if (healed) {
-        result = await run(bin, args, workspace);
-        result.repaired = true;
-    }
-
-    return result;
+    return await run(bin, args, workspace, env);
 }
 
-/* -----------------------------
-   API: /run
-------------------------------*/
+/* -------------------------
+   API
+------------------------- */
 
 app.post("/run", async (req, res) => {
 
@@ -177,7 +144,6 @@ app.post("/run", async (req, res) => {
     fs.mkdirSync(workspace, { recursive: true });
 
     try {
-        // Write incoming files
         writeFiles(workspace, files);
 
         const result = await execute(runtime, command, workspace);
@@ -189,22 +155,12 @@ app.post("/run", async (req, res) => {
         });
 
     } catch (e) {
-        res.status(500).json({
-            error: e.message
-        });
+        res.status(500).json({ error: e.message });
     }
 });
 
-/* -----------------------------
-   HTML preview (static)
-------------------------------*/
-
 app.use("/preview", express.static(SANDBOX_ROOT));
 
-/* -----------------------------
-   Start server
-------------------------------*/
-
 app.listen(process.env.PORT || 8080, "0.0.0.0", () => {
-    console.log("Universal Sandbox (hardened) running");
+    console.log("Sandbox runtime online");
 });
