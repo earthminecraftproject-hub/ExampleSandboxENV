@@ -2,6 +2,7 @@
   "name": "sandbox",
   "type": "module",
   "dependencies": {
+    "cors": "^2.8.6",
     "express": "^4.18.2"
   }
 }
